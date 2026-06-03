@@ -1,0 +1,73 @@
+name: Deploy to DirectAdmin
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  # DirectAdmin: ~/domains/<domain>/public_html/
+  DEPLOY_PATH: domains/test.hoshisky.com/public_html
+  APP_NAME: test-hoshisky-com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "${{ secrets.SSH_PORT || 22 }}" -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync files to server
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+        run: |
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'node_modules' \
+            --exclude '.env' \
+            -e "ssh -p ${SSH_PORT} -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./ "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
+
+      - name: Install dependencies and restart app
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_PORT: ${{ secrets.SSH_PORT || 22 }}
+          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
+          APP_NAME: ${{ env.APP_NAME }}
+        run: |
+          ssh -p "${SSH_PORT}" -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" bash -s << EOF
+          set -e
+          cd "${DEPLOY_PATH}"
+
+          if [ -f package-lock.json ]; then
+            npm ci --omit=dev
+          else
+            npm install --omit=dev
+          fi
+
+          if command -v pm2 >/dev/null 2>&1; then
+            pm2 describe "${APP_NAME}" >/dev/null 2>&1 \
+              && pm2 restart "${APP_NAME}" \
+              || pm2 start index.js --name "${APP_NAME}"
+            pm2 save
+          else
+            pkill -f "node ${DEPLOY_PATH}/index.js" 2>/dev/null || true
+            nohup node index.js >> app.log 2>&1 &
+          fi
+          EOF
