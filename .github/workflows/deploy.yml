@@ -1,18 +1,14 @@
-name: Deploy to DirectAdmin
+name: Deploy to DirectAdmin via SSH
 
 on:
   push:
     branches:
-      - main
       - master
   workflow_dispatch:
 
 env:
-  # DirectAdmin: ~/domains/<domain>/public_html/
   DEPLOY_PATH: domains/test.hoshisky.com/public_html
   APP_NAME: test-hoshisky-com
-  # Host này thường dùng SSH port 2222 (không phải 22)
-  SSH_PORT: ${{ secrets.SSH_PORT || '2222' }}
 
 jobs:
   deploy:
@@ -22,97 +18,50 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup SSH key
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_PORT: ${{ env.SSH_PORT }}
+      - name: Setup SSH Key
         run: |
-          set -e
           mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-
-          if [ -z "$SSH_PRIVATE_KEY" ]; then
-            echo "::error::Secret SSH_PRIVATE_KEY chưa được cấu hình"
-            exit 1
-          fi
-          if [ -z "$SSH_HOST" ]; then
-            echo "::error::Secret SSH_HOST chưa được cấu hình"
-            exit 1
-          fi
-
-          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
+          # Bỏ qua xác thực host để tránh kẹt tiến trình
+          echo "StrictHostKeyChecking accept-new" >> ~/.ssh/config
 
-          if ! ssh-keygen -y -f ~/.ssh/deploy_key >/dev/null 2>&1; then
-            echo "::error::SSH_PRIVATE_KEY không hợp lệ (thiếu dòng, sai format OpenSSH)"
-            exit 1
-          fi
-
-          # ssh-keyscan fail không được làm dừng job (bash -e); server có thể đóng trước khi gửi banner
-          if ! ssh-keyscan -T 10 -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null; then
-            echo "::warning::ssh-keyscan thất bại — dùng StrictHostKeyChecking=accept-new khi kết nối"
-          fi
-          chmod 644 ~/.ssh/known_hosts 2>/dev/null || true
-
-      - name: Verify SSH connection
+      - name: Sync Minimal Files (Only index.js & package.json)
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PORT: ${{ env.SSH_PORT }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '2222' }}
         run: |
-          set -e
-          if [ -z "$SSH_USER" ]; then
-            echo "::error::Secret SSH_USER chưa được cấu hình"
-            exit 1
-          fi
-          ssh -p "$SSH_PORT" -i ~/.ssh/deploy_key \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            -o StrictHostKeyChecking=accept-new \
-            "${SSH_USER}@${SSH_HOST}" "echo SSH OK && pwd"
-
-      - name: Sync files to server
-        env:
-          SSH_HOST: ${{ secrets.SSH_HOST }}
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PORT: ${{ env.SSH_PORT }}
-          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
-        run: |
+          # Sử dụng rsync để đẩy file, loại bỏ toàn bộ các file khác, chỉ giữ lại index.js và package.json
           rsync -avz --delete \
-            --exclude '.git' \
-            --exclude '.github' \
-            --exclude 'node_modules' \
-            --exclude '.env' \
-            -e "ssh -p ${SSH_PORT} -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new" \
+            --include='index.js' \
+            --include='package.json' \
+            --exclude='*' \
+            -e "ssh -p ${SSH_PORT} -i ~/.ssh/deploy_key" \
             ./ "${SSH_USER}@${SSH_HOST}:${DEPLOY_PATH}/"
 
-      - name: Install dependencies and restart app
+      - name: Start/Restart Node App via SSH
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_PORT: ${{ env.SSH_PORT }}
-          DEPLOY_PATH: ${{ env.DEPLOY_PATH }}
-          APP_NAME: ${{ env.APP_NAME }}
+          SSH_PORT: ${{ secrets.SSH_PORT || '2222' }}
         run: |
-          ssh -p "${SSH_PORT}" -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
-            "${SSH_USER}@${SSH_HOST}" bash -s << EOF
+          ssh -p "${SSH_PORT}" -i ~/.ssh/deploy_key "${SSH_USER}@${SSH_HOST}" bash -s << EOF
           set -e
           cd "${DEPLOY_PATH}"
 
-          if [ -f package-lock.json ]; then
-            npm ci --omit=dev
-          else
-            npm install --omit=dev
-          fi
+          # Tự động cài đặt thư viện sản xuất (bỏ qua dev)
+          npm install --omit=dev
 
+          # Quản lý tiến trình: Kiểm tra nếu có pm2 thì dùng pm2, không thì chạy nền với nohup
           if command -v pm2 >/dev/null 2>&1; then
             pm2 describe "${APP_NAME}" >/dev/null 2>&1 \
               && pm2 restart "${APP_NAME}" \
               || pm2 start index.js --name "${APP_NAME}"
             pm2 save
           else
-            pkill -f "node ${DEPLOY_PATH}/index.js" 2>/dev/null || true
+            # Nếu không có PM2, tắt tiến trình cũ chạy index.js tại thư mục này và bật cái mới
+            pkill -f "node index.js" 2>/dev/null || true
             nohup node index.js >> app.log 2>&1 &
           fi
           EOF
